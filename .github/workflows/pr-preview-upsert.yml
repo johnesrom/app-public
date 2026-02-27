@@ -1,0 +1,101 @@
+# Este workflow gera imagem por PR e atualiza o repositório de manifests
+# com um arquivo previews/pr-<numero>.yaml para o Argo CD sincronizar.
+name: PR Preview Upsert
+
+# Dispara quando PR é aberta, reaberta ou recebe novos commits.
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+
+# Permissões mínimas:
+# - contents:read para clonar código
+# - packages:write para publicar imagem no GHCR
+permissions:
+  contents: read
+  packages: write
+
+# Evita dois pipelines concorrentes para a mesma PR.
+# Se chegar novo commit na PR, cancela a execução anterior.
+concurrency:
+  group: pr-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-upsert:
+    # Segurança: roda apenas para PRs do mesmo repositório (não forks).
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+
+    steps:
+      # Faz checkout do commit exato da PR (head SHA).
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      # Calcula coordenadas da imagem e expõe via outputs para próximos passos.
+      - name: Define image metadata
+        id: meta
+        shell: bash
+        run: |
+          IMAGE_REPO="ghcr.io/johnesrom/app-public"
+          IMAGE_TAG="pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}"
+          echo "image_repo=${IMAGE_REPO}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "pr_number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+
+      # Autentica no GitHub Container Registry.
+      - name: Login GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Builda a imagem com o Dockerfile do projeto e publica no GHCR.
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.image_tag }}
+
+      # Clona o repositório GitOps onde ficam os manifests.
+      # Requer secret MANIFESTS_REPO_TOKEN no repo app-public.
+      - name: Checkout manifests repository
+        uses: actions/checkout@v4
+        with:
+          repository: johnesrom/app-manifests
+          token: ${{ secrets.MANIFESTS_REPO_TOKEN }}
+          path: manifests
+
+      # Cria/atualiza arquivo por PR com imagem e host dinâmico.
+      # Esse arquivo é o contrato para o lado GitOps (Argo CD).
+      - name: Upsert PR preview values
+        shell: bash
+        run: |
+          mkdir -p manifests/previews
+          cat > "manifests/previews/pr-${{ steps.meta.outputs.pr_number }}.yaml" <<EOF
+          prNumber: "${{ steps.meta.outputs.pr_number }}"
+          image:
+            repository: "${{ steps.meta.outputs.image_repo }}"
+            tag: "${{ steps.meta.outputs.image_tag }}"
+          ingress:
+            host: "pr-${{ steps.meta.outputs.pr_number }}.localtest.me"
+          EOF
+
+      # Versiona a mudança no app-manifests e envia para o GitHub.
+      # Se o conteúdo não mudou, segue sem falhar.
+      - name: Commit and push manifests
+        shell: bash
+        run: |
+          cd manifests
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "previews/pr-${{ steps.meta.outputs.pr_number }}.yaml"
+          git commit -m "preview(pr-${{ steps.meta.outputs.pr_number }}): ${{ steps.meta.outputs.image_tag }}" || echo "No changes to commit"
+          git push
