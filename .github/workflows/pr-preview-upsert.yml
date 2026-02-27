@@ -43,9 +43,15 @@ jobs:
         run: |
           IMAGE_REPO="ghcr.io/johnesrom/app-public"
           IMAGE_TAG="pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}"
+          APP_NAME="app-pr-${{ github.event.pull_request.number }}"
+          NAMESPACE="preview-pr-${{ github.event.pull_request.number }}"
+          HOST="pr-${{ github.event.pull_request.number }}.localtest.me"
           echo "image_repo=${IMAGE_REPO}" >> "$GITHUB_OUTPUT"
           echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
           echo "pr_number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          echo "app_name=${APP_NAME}" >> "$GITHUB_OUTPUT"
+          echo "namespace=${NAMESPACE}" >> "$GITHUB_OUTPUT"
+          echo "host=${HOST}" >> "$GITHUB_OUTPUT"
 
       # Autentica no GitHub Container Registry.
       - name: Login GHCR
@@ -64,6 +70,18 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.image_tag }}
 
+      # Falha cedo com mensagem clara caso o token não esteja configurado.
+      - name: Validate manifests token
+        shell: bash
+        env:
+          MANIFESTS_REPO_TOKEN: ${{ secrets.MANIFESTS_REPO_TOKEN }}
+        run: |
+          if [ -z "${MANIFESTS_REPO_TOKEN}" ]; then
+            echo "Secret ausente: MANIFESTS_REPO_TOKEN"
+            echo "Configure em: app-public > Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
       # Clona o repositório GitOps onde ficam os manifests.
       # Requer secret MANIFESTS_REPO_TOKEN no repo app-public.
       - name: Checkout manifests repository
@@ -73,19 +91,83 @@ jobs:
           token: ${{ secrets.MANIFESTS_REPO_TOKEN }}
           path: manifests
 
-      # Cria/atualiza arquivo por PR com imagem e host dinâmico.
-      # Esse arquivo é o contrato para o lado GitOps (Argo CD).
-      - name: Upsert PR preview values
+      # Cria/atualiza manifest completo por PR.
+      # O Argo CD aplicará Namespace + Deployment + Service + Ingress.
+      # Observação: usamos Deployment (não ReplicaSet direto), pois ele gerencia
+      # ReplicaSet e Pod automaticamente.
+      - name: Upsert PR preview manifests
         shell: bash
         run: |
           mkdir -p manifests/previews
           cat > "manifests/previews/pr-${{ steps.meta.outputs.pr_number }}.yaml" <<EOF
-          prNumber: "${{ steps.meta.outputs.pr_number }}"
-          image:
-            repository: "${{ steps.meta.outputs.image_repo }}"
-            tag: "${{ steps.meta.outputs.image_tag }}"
-          ingress:
-            host: "pr-${{ steps.meta.outputs.pr_number }}.localtest.me"
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: ${{ steps.meta.outputs.namespace }}
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${{ steps.meta.outputs.app_name }}
+            namespace: ${{ steps.meta.outputs.namespace }}
+            labels:
+              app: ${{ steps.meta.outputs.app_name }}
+              pr: "${{ steps.meta.outputs.pr_number }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: ${{ steps.meta.outputs.app_name }}
+            template:
+              metadata:
+                labels:
+                  app: ${{ steps.meta.outputs.app_name }}
+                  pr: "${{ steps.meta.outputs.pr_number }}"
+              spec:
+                containers:
+                  - name: app
+                    image: ${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.image_tag }}
+                    imagePullPolicy: Always
+                    ports:
+                      - containerPort: 80
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${{ steps.meta.outputs.app_name }}
+            namespace: ${{ steps.meta.outputs.namespace }}
+            labels:
+              app: ${{ steps.meta.outputs.app_name }}
+          spec:
+            selector:
+              app: ${{ steps.meta.outputs.app_name }}
+            ports:
+              - name: http
+                port: 80
+                targetPort: 80
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: ${{ steps.meta.outputs.app_name }}
+            namespace: ${{ steps.meta.outputs.namespace }}
+            labels:
+              app: ${{ steps.meta.outputs.app_name }}
+            annotations:
+              nginx.ingress.kubernetes.io/rewrite-target: /
+          spec:
+            ingressClassName: nginx
+            rules:
+              - host: ${{ steps.meta.outputs.host }}
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: ${{ steps.meta.outputs.app_name }}
+                          port:
+                            number: 80
           EOF
 
       # Versiona a mudança no app-manifests e envia para o GitHub.
