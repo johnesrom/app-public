@@ -181,3 +181,29 @@ jobs:
           git add "previews/pr-${{ steps.meta.outputs.pr_number }}.yaml"
           git commit -m "preview(pr-${{ steps.meta.outputs.pr_number }}): ${{ steps.meta.outputs.image_tag }}" || echo "No changes to commit"
           git push
+          
+  delete-preview:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout manifests repository
+        uses: actions/checkout@v4
+        with:
+          repository: johnesrom/app-manifests
+          token: ${{ secrets.MANIFESTS_REPO_TOKEN }}
+          path: manifests
+
+      - name: Remove PR preview manifest
+        shell: bash
+        run: |
+          cd manifests
+          FILE="previews/pr-${{ github.event.pull_request.number }}.yaml"
+          if [ -f "$FILE" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git rm "$FILE"
+            git commit -m "cleanup(pr-${{ github.event.pull_request.number }}): remove preview"
+            git push
+          else
+            echo "Preview manifest not found."
+          fi
